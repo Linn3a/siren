@@ -1,0 +1,10 @@
+torch==2.6.0 
+torch-complex==0.4.4 
+torchaudio==2.6.0 
+torchdata==0.11.0 
+torchmetrics==1.7.1 
+torchvision==0.21.0
+vllm==0.8.3
+flash-attn==2.7.1.post4
+math-verify==0.7.0
+matplotlib
