@@ -50,7 +50,7 @@ bash exp_scripts/eval.sh
 
 - The training script (siren.sh) contains default hyperparameters and can be customized according to your experimental setup. 
 
-# Acknowledgement 🫰
+## Acknowledgement 🫰
 
 We thank the open-source communities behind the following projects for their valuable contributions:
 - Frameworks: [veRL](https://github.com/volcengine/verl), [vLLM](https://github.com/vllm-project/vllm) , [Math-Verify](https://github.com/huggingface/Math-Verify)
