@@ -61,6 +61,7 @@ from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
+from verl.workers.actor import mask_by_quantile
 
 WorkerType = Type[Worker]
 
@@ -808,6 +809,9 @@ class RayPPOTrainer:
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+        
+        if 'entropy_anchor' in self.config.algorithm:
+            self.entropy_anchor = self.config.algorithm.entropy_anchor
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
@@ -977,6 +981,27 @@ class RayPPOTrainer:
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         batch = batch.union(old_log_prob)
+                        
+                        
+                        if self.global_steps == 1 and (self.config.actor_rollout_ref.actor.experiment_type=='siren' or self.config.actor_rollout_ref.actor.experiment_type=='naive_entropy_reg_adaptive'):
+                            entropy_agg_mode = self.config.actor_rollout_ref.actor.get("entropy_agg_mode", "seq-mean-token-mean")
+                            
+                            if self.config.actor_rollout_ref.actor.experiment_type=='naive_entropy_reg_adaptive':
+                                entropy_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            
+                            if self.config.actor_rollout_ref.actor.use_siren:
+                                mask_ratio = self.config.actor_rollout_ref.actor.get("mask_ratio", 0.8)
+                                masked_entropy, value_mask, _ = mask_by_quantile(batch.batch['entropys'], batch.batch['response_mask'], 1, mask_ratio)
+                                
+                            else:
+                                masked_entropy = batch.batch['entropys']
+                                value_mask = batch.batch['response_mask']
+                            
+                            self.entropy_anchor = agg_loss(loss_mat=masked_entropy, loss_mask=value_mask, loss_agg_mode=entropy_agg_mode)
+                            batch.non_tensor_batch["entropy_anchor"] = np.array([self.entropy_anchor] * len(batch.non_tensor_batch["data_source"]))
+                            
+                            print(f"set initial entropy_anchor: {self.entropy_anchor}")
+
 
                         if 'entropys' in batch.batch:
                             metrics.update(
@@ -1080,12 +1105,11 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
 
-                    if self.global_steps == 2:
-                        print(f"update entropy_anchor in step {self.global_steps}: {self.entropy_anchor}")
-                        
-
-                        
-                        batch.non_tensor_batch["entropy_anchor"] = np.array([self.entropy_anchor] * len(batch.non_tensor_batch["data_source"]))
+                    if self.global_steps > 2:
+                        if hasattr(self, 'entropy_anchor'):
+                            print(f"update entropy_anchor in step {self.global_steps}: {self.entropy_anchor}")
+                            
+                            batch.non_tensor_batch["entropy_anchor"] = np.array([self.entropy_anchor] * len(batch.non_tensor_batch["data_source"])) 
 
                     
                     # implement critic warmup

@@ -90,11 +90,9 @@ def mask_by_quantile(x: torch.Tensor, response_mask: torch.Tensor, upper: float,
 
     x_masked = x.masked_fill(~response_mask.to(dtype=torch.bool),float('nan')).float()
 
-    upper_bound = torch.nanquantile(x_masked, upper, dim=-1, keepdim=True)
     lower_bound = torch.nanquantile(x_masked, lower, dim=-1, keepdim=True)
 
-
-    quantile_mask = (x >= lower_bound)
+    quantile_mask = (x > lower_bound)
     masked_x = torch.where(quantile_mask, x, torch.zeros_like(x))
     return masked_x, quantile_mask, lower_bound
 
@@ -112,10 +110,21 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.experiment_type = self.config.get("experiment_type", "baseline")
         self.entropy_agg_mode = self.config.get("entropy_agg_mode", "seq-mean-token-mean")
+        
+        if self.experiment_type.startswith("naive"):
+            self.entropy_agg_mode = self.config.loss_agg_mode
+            
         self.mask_ratio = self.config.get("mask_ratio", 0.8)
+        
+        self.use_siren = self.config.get("use_siren", True)
+        self.no_entropy_loss = self.config.get("no_entropy_loss", False)
 
         self.entropy_topk = self.config.get("entropy_topk", 10000)
         self.entropy_topp = self.config.get("entropy_topp", 0.8)
+        
+        self.entropy_coeff_lr = self.config.get("entropy_coeff_lr", 0)
+        self.entropy_coeff = self.config.entropy_coeff
+        
 
         print(f"entropy_topk: {self.entropy_topk}, entropy_topp: {self.entropy_topp}")
 
@@ -127,13 +136,7 @@ class DataParallelPPOActor(BasePPOActor):
 
             print(f"clip entropy from {self.mask_ratio} to {self.mask_ratio_upper}")
 
-        # self.compute_entropy_from_logits = (
-        #     torch.compile(verl_F.entropy_from_logits, dynamic=True)
-        #     if self.config.get("use_torch_compile", True)  #  use torch compile by default
-        #     else verl_F.entropy_from_logits
-        # )
-
-        if self.experiment_type == "baseline_entropy_adv" or self.experiment_type == "baseline_eighty_twenty" or self.experiment_type == "naive_entropy_reg" or self.experiment_type == "abla_wo_topp" or self.experiment_type == "baseline" or self.experiment_type == "abla_only_anchor":
+        if not self.use_siren and (self.experiment_type == "baseline_entropy_adv" or self.experiment_type == "baseline_eighty_twenty" or self.experiment_type == "naive_entropy_reg" or self.experiment_type == "naive_entropy_reg_adaptive" or self.experiment_type == "abla_wo_topp" or self.experiment_type == "baseline" or self.experiment_type == "abla_only_anchor"):
             print("use naive entropy calculation")
             self.compute_entropy_from_logits = (
                 torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -207,7 +210,7 @@ class DataParallelPPOActor(BasePPOActor):
                     full_entropy_rmpad = None
                     # entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
                     try:
-                        entropy_rmpad, full_entropy_rmpad = self.compute_entropy_from_logits_w_topp(logits_rmpad, self.entropy_topk,  self.entropy_topp)
+                        entropy_rmpad, full_entropy_rmpad = self.compute_entropy_from_logits_w_topp(logits_rmpad, self.entropy_topk, self.entropy_topp)
                     except:
                         entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
 
@@ -391,7 +394,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
-
+                
                 for data in micro_batches:
                     # Support all hardwares
                     if isinstance(data, DataProto):
@@ -409,110 +412,139 @@ class DataParallelPPOActor(BasePPOActor):
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
                     
                     calculate_entropy = True
                     entropy, log_prob, full_entropy = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
                     
-                    
-                    if self.experiment_type == "baseline_entropy_adv":
-                        alpha = 0.4
-                        kappa = 2
-                        advantages += torch.min(alpha * entropy.detach(), advantages.abs()/kappa)
-
-                    if self.experiment_type == "baseline_kl_cov":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_kl_cov(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                    elif self.experiment_type == "baseline_clip_cov":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_clip_cov(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                    
-                    elif self.experiment_type == "baseline_eighty_twenty":
-                        masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, 1, 0.8)
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=value_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                    else:
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                    
-                    
-                    if self.experiment_type == "naive_entropy_reg":
-                        value_mask = response_mask
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=value_mask, loss_agg_mode=loss_agg_mode)
-                        entropy_loss_mse = -1 * entropy_loss
-
-                    elif self.experiment_type == "abla_wo_anchor":
+                    if self.use_siren:
                         masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, 1, self.mask_ratio)
-                        entropy_loss = agg_loss(loss_mat=masked_entropy, loss_mask=value_mask, loss_agg_mode=self.entropy_agg_mode)
-                        entropy_loss_mse = -1 * entropy_loss
-             
+                        entropy = masked_entropy
+                        
+                    if self.no_entropy_loss:
+                        
+                        if self.experiment_type == "baseline_entropy_adv":
+                            if "adv_alpha" in self.config:
+                                alpha = self.config.adv_alpha
+                            else:
+                                alpha = 0.4
+                            print(f"baseline entropy advantage with alpha={alpha}")
+                            kappa = 1
+                            advantages += torch.min(alpha * entropy.detach(), advantages.abs()/kappa)
 
-                    elif self.experiment_type == "siren" or self.experiment_type == "abla_wo_topp":
-                        if hasattr(self, "mask_ratio_upper"):
-                            masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, self.mask_ratio_upper, self.mask_ratio)
+                        if self.experiment_type == "baseline_kl_cov":
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_kl_cov(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                        elif self.experiment_type == "baseline_clip_cov":
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_clip_cov(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                        
+                        elif self.experiment_type == "baseline_eighty_twenty":
+                            masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, 1, 0.8)
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=value_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
                         else:
-                            masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, 1, self.mask_ratio)
-                            
-                    elif self.experiment_type == "abla_token_first":
-                        masked_entropy, value_mask, lower_bound = mask_by_quantile(full_entropy, response_mask, 1, self.mask_ratio)
-                                                    
-                    
-                    elif self.experiment_type == "abla_wo_token" or self.experiment_type == "abla_only_anchor":
-                        value_mask = response_mask
-                    else:
-                        raise ValueError(f"Invalid experiment_type {self.experiment_type}")
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
 
-                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=value_mask, loss_agg_mode=self.entropy_agg_mode)
-                    
-                    
-                    if hasattr(self, 'entropy_anchor'):
-                        entropy_change = entropy_loss - self.entropy_anchor.to(entropy_loss.device)
-                        entropy_loss_mse = entropy_change.pow(2).mean()  
-                    else:
-                        self.entropy_anchor = entropy_loss.detach()
+                        entropy_loss = torch.tensor(0.0)
                         entropy_loss_mse = torch.tensor(0.0)
-                
                     
-                    policy_loss = pg_loss + entropy_loss_mse * entropy_coeff
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                        if self.experiment_type == "naive_entropy_reg" or self.experiment_type == "naive_entropy_reg_adaptive":
+                            value_mask = response_mask
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=value_mask, loss_agg_mode=self.entropy_agg_mode)
+                            entropy_loss_mse = -1 * entropy_loss
+                            
+                            if not hasattr(self, 'entropy_anchor'): 
+                                self.entropy_anchor = entropy_loss.detach()
 
+                        elif self.experiment_type == "abla_wo_anchor":
+                            masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, 1, self.mask_ratio)
+                            entropy_loss = agg_loss(loss_mat=masked_entropy, loss_mask=value_mask, loss_agg_mode=self.entropy_agg_mode)
+                            entropy_loss_mse = -1 * entropy_loss
+                
+                        # use anchor
+                        elif self.experiment_type == "siren" or self.experiment_type == "abla_wo_topp" or self.experiment_type == "abla_token_first" or self.experiment_type == "abla_wo_token" or self.experiment_type == "abla_only_anchor":
+                            
+                            if self.experiment_type == "siren" or self.experiment_type == "abla_wo_topp":
+                                if hasattr(self, "mask_ratio_upper"):
+                                    masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, self.mask_ratio_upper, self.mask_ratio)
+                                else:
+                                    masked_entropy, value_mask, lower_bound = mask_by_quantile(entropy, response_mask, 1, self.mask_ratio)
+                                
+                            elif self.experiment_type == "abla_token_first":
+                                masked_entropy, value_mask, lower_bound = mask_by_quantile(full_entropy, response_mask, 1, self.mask_ratio)
+                                                        
+                        
+                            elif self.experiment_type == "abla_wo_token" or self.experiment_type == "abla_only_anchor":
+                                value_mask = response_mask
+                            
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=value_mask, loss_agg_mode=self.entropy_agg_mode)
+                        
+                        
+                            if hasattr(self, 'entropy_anchor'):
+                                entropy_change = entropy_loss - self.entropy_anchor.to(entropy_loss.device)
+                                entropy_loss_mse = entropy_change.pow(2).mean()  
+                            # else:
+                            #     self.entropy_anchor = entropy_loss.detach()
+                            #     entropy_loss_mse = torch.tensor(0.0)
+                            
+                                
+                        else:
+                            raise ValueError(f"Invalid experiment_type {self.experiment_type}")
+                        
+                        
+                    policy_loss = pg_loss + entropy_loss_mse * self.entropy_coeff
+                    
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
@@ -532,7 +564,20 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
+                        
                     loss.backward()
+                    
+                    
+                    if self.experiment_type == "naive_entropy_reg_adaptive":
+                    # update entropy coeff
+                        if hasattr(self, 'entropy_anchor'):
+                            alpha_gradient = self.entropy_anchor - entropy_loss.detach()
+                        else:
+                            alpha_gradient = torch.tensor(0.0)
+                        
+                        self.entropy_coeff += self.entropy_coeff_lr * alpha_gradient.item()
+                        if self.entropy_coeff < 0:
+                            self.entropy_coeff = 0.0
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
@@ -541,6 +586,7 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         "actor/entropy_loss": entropy_loss.detach().item(),
                         "actor/mse_entropy_loss": entropy_loss_mse.detach().item(),
+                        "actor/entropy_coeff": self.entropy_coeff,
                     }
 
                     if hasattr(self, 'entropy_anchor'):

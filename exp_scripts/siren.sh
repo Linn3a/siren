@@ -32,18 +32,18 @@ use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 
-entropy_coeff=0.0
 entropy_coeff=0.005
 kl_coeff=0.000
-entropy_update_steps=800
 
 experiment_type=siren
+use_siren=True
+no_entropy_loss=False
 
 mask_ratio=0.8
 entropy_topk=10000
 entropy_topp=0.8
 
-wandb_name=${experiment_type}_${entropy_coeff}_token${mask_ratio}_topk${entropy_topk}_topp${entropy_topp}
+wandb_name=${experiment_type}${use_siren}_${entropy_coeff}_token${mask_ratio}_topk${entropy_topk}_topp${entropy_topp}
 
 python3 -m verl.trainer.main_ppo \
 algorithm.adv_estimator=grpo \
@@ -77,6 +77,9 @@ actor_rollout_ref.model.enable_gradient_checkpointing=True \
 actor_rollout_ref.actor.fsdp_config.param_offload=False \
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
 +actor_rollout_ref.actor.experiment_type=${experiment_type} \
++actor_rollout_ref.actor.use_siren=${use_siren} \
++actor_rollout_ref.actor.mask_ratio=${mask_ratio} \
++actor_rollout_ref.actor.no_entropy_loss=${no_entropy_loss} \
 actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
 actor_rollout_ref.rollout.name=vllm \
 actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
