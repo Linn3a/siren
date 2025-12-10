@@ -337,7 +337,11 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)  # token-mean
+        valid_mask = torch.sum(loss_mask, dim=-1) > 0
+        seq_losses = torch.zeros_like(valid_mask, dtype=loss_mat.dtype, device=loss_mat.device)
+        # seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)   # token-mean
+        seq_losses[valid_mask] = torch.sum(loss_mat * loss_mask, dim=-1)[valid_mask] / torch.sum(loss_mask, dim=-1)[valid_mask]  # token-mean
+        
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
